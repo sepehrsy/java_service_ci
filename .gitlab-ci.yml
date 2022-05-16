@@ -1,0 +1,135 @@
+default:
+  image: maven:3.8.2-amazoncorretto-11
+
+cache:
+  paths:
+    - .m2
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+
+stages:
+  - mvn_build
+  - mvn_test
+  - mvn_deploy
+  - docker_image
+  - k8s_deploy_stage
+  - k8s_deploy_prod
+
+.m2_create:
+  before_script:
+    - |
+      if [[ ! -d ~/.m2 ]]; then
+        mkdir ~/.m2
+      fi
+    - cp .settings.xml ~/.m2/settings.xml
+    - sed -i ~/.m2/settings.xml -e "s/Localrepo_User/${Localrepo_User}/"
+    - sed -i ~/.m2/settings.xml -e "s/Localrepo_Pass/${Localrepo_Pass}/"
+
+.docker_build:
+  before_script:
+    - export POM_VERSION=`grep -A 10 "</parent>" $CI_PROJECT_DIR/pom.xml | grep "<version>" | head -1 | awk -F '>' '{print $2}' | awk -F '<' '{print $1}'`
+    - echo $POM_VERSION
+    - docker login -u $DOCKER_LOGIN -p $DOCKER_PASS $DOCKER_BASE
+    - cd /opt/
+    - wget https://$Localrepo_User:$Localrepo_Pass@Localrepo_URL/libs-snapshot/com/$CI_PROJECT_NAME/SERVICENAME/$POM_VERSION/SERVICENAME-$POM_VERSION.jar -O SERVICENAME-$POM_VERSION.jar
+    - |
+        {
+          echo FROM amazoncorretto:11
+          echo COPY ./SERVICENAME-$POM_VERSION.jar /opt/
+          echo WORKDIR /opt/
+          echo CMD [\"java\", \"-jar\", \"SERVICENAME-${POM_VERSION}.jar\"]
+        } > Dockerfile
+    - docker build . -t Localrepo_URL/docker/$CI_PROJECT_NAME/SERVICENAME:$POM_VERSION
+    - docker push Localrepo_URL/docker/$CI_PROJECT_NAME/SERVICENAME:$POM_VERSION
+
+.k8s_init:
+  before_script:
+    - export HOME=$CI_PROJECT_DIR
+    - kubectl config set-cluster devenv --server="${K8S_SERVER}"
+    - kubectl config set clusters.k8s.certificate-authority-data ${K8S_CERTIFICATE_AUTHORITY_DATA}
+    - kubectl config set-credentials gitlab --token="${K8S_USER_TOKEN}"
+    - kubectl config set-context default --cluster=devenv --user=gitlab
+    - kubectl config use-context default
+
+.k8s_init_prod:
+  before_script:
+    - export HOME=$CI_PROJECT_DIR
+    - kubectl config set-cluster devenv --server="${K8S_PROD_SERVER}"
+    - kubectl config set clusters.k8s.certificate-authority-data ${K8S_PROD_CERTIFICATE_AUTHORITY_DATA}
+    - kubectl config set-credentials gitlab --token="${K8S_PROD_USER_TOKEN}"
+    - kubectl config set-context default --cluster=devenv --user=gitlab
+    - kubectl config use-context default
+
+mvn_build:
+  extends: .m2_create
+  stage: mvn_build
+  needs: []
+  script:
+    - mvn clean install -DskipTests
+  artifacts:
+    paths:
+      - '*/target'
+  rules:
+    - if: ($CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/ || $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/)
+
+mvn_test:
+  extends: .m2_create
+  needs: [mvn_build]
+  stage: mvn_test
+  script:
+    - mvn test
+  rules:
+    - if: ($CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/ || $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/)
+
+mvn_deploy:
+  extends: .m2_create
+  stage: mvn_deploy
+  needs: [mvn_test]
+  script:
+    - mvn deploy
+  rules:
+    - if: ($CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/ || $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/)
+
+build_CI_PROJECT_NAME_docker_image:
+  variables:
+    MICROSERVICE: SERVICENAME
+  extends: .docker_build
+  stage: docker_image
+  needs: [mvn_deploy]
+  image: Localrepo_URL/docker/docker:latest
+  script:
+    - echo SERVICENAME
+  rules:
+    - if: ($CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/ || $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/)
+
+
+k8s_deploy_stage:
+  image:
+    name: artifactory.spng.ir/docker/bitnami/kubectl:latest
+    entrypoint: [""]
+  stage: k8s_deploy_stage
+  needs: [build_SERVICENAME_docker_image]
+  extends: .k8s_init_stage
+  script:
+    - kubectl --insecure-skip-tls-verify replace --force -f deployment_stage.yaml
+    - grep "host:" deployment_stage.yaml | awk '{print $3}'
+  environment:
+    name: NS_NAME
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-rc$/
+
+k8s_deploy_prod:
+  image:
+    name: artifactory.spng.ir/docker/bitnami/kubectl:latest
+    entrypoint: [""]
+  stage: k8s_deploy_prod
+  needs: [build_SERVICENAME_docker_image]
+  extends: .k8s_init_prod
+  script:
+    - kubectl --insecure-skip-tls-verify replace --force -f deployment_prod.yaml
+    - grep "host:" deployment_prod.yaml | awk '{print $3}'
+  environment:
+    name: NS_NAME
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+\-master$/
